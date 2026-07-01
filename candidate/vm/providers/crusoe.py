@@ -96,7 +96,8 @@ class CrusoeProvider(Provider):
             else:
                 iid = r.json()["instance"]["id"]
                 return self._await_state(iid, {State.RUNNING}) if wait else self.get(iid)
-        raise last_err  # exhausted all regions with CapacityError
+        # exhausted all regions with CapacityError (or, defensively, empty region list)
+        raise last_err or CapacityError(self.name, f"no capacity for {native_type} in any region")
 
     def create(self, gpu, count=1, name=None, region=None, wait=True) -> CreateResult:
         native_type = catalog.to_native(self.name, gpu)["type"]
