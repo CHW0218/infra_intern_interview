@@ -1,6 +1,8 @@
 .venv/
 __pycache__/
 *.pyc
+.pytest_cache/
 .DS_Store
-candidate/*
-!candidate/.gitkeep
+# candidate/ holds our solution and is tracked on this branch; only ignore its caches/venv
+candidate/.venv/
+candidate/**/__pycache__/
