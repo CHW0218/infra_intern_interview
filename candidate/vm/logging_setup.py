@@ -13,6 +13,10 @@ def configure(verbose: bool = False) -> None:
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(levelname)s %(message)s",
     )
+    # Quiet noisy third-party request loggers (httpx logs every call at INFO)
+    if not verbose:
+        for noisy in ("httpx", "httpcore", "grpc"):
+            logging.getLogger(noisy).setLevel(logging.WARNING)
     _CONFIGURED = True
 
 
