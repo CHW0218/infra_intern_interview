@@ -131,8 +131,11 @@ _wait_for_state(id, target_states, timeout≈20s, interval≈0.4s)
 - `destroy` → poll until `NotFoundError`; `stop` → `{STOPPED}`; `start` → `{RUNNING}`.
 
 Verified in mock code: **capacity/auth/precondition errors are raised synchronously at
-submit** (before the async delay), so Layer-2 failover is fast. Waiting is per-instance, so
-Layer 2 submits all creates first then waits in parallel (fleet of 8 ≈ 3s, not 8×3s).
+submit** (before the async delay), so Layer-2 failover is fast. Because waiting is
+per-instance, the fleet manager fires **every provider's creates concurrently in a single
+round** (§7) — so a fleet of 8 spread across 3 providers costs ≈ one create (~3s), not the
+sum. A failover round (only for the shortfall) adds ~3s each; the common no-failover case is
+one round.
 
 ---
 
@@ -152,6 +155,29 @@ Canonical vocabulary the user types: `a100.1x, a100.8x, h100.1x, h100.8x, h200.1
 Unsupported combos fail before any network call with a helpful message. The catalog also
 tells the scheduler which providers are eligible for a fleet request.
 
+### Region normalization (capacity is partitioned by region × type)
+
+The mocks key capacity by `(region, type)`, and each provider names regions differently
+(**Crusoe** `us-west1`, **Lambda** `us-west-1` (extra dash), **Nebius** has *no* region —
+capacity is keyed by `platform/preset`). So the catalog also normalizes a **canonical region
+vocabulary**: `us-west, us-east, eu-west`.
+
+| Canonical | Crusoe | Lambda | Nebius |
+|---|---|---|---|
+| `us-west` | `us-west1` | `us-west-1` | — |
+| `us-east` | `us-east1` | `us-east-1` | — |
+| `eu-west` | `eu-west1` | `eu-west-1` | — |
+
+- `--region` accepts canonical; `provider.create` translates canonical → native. Nebius
+  ignores region entirely.
+- `capacity()` reports **canonical** regions, so the scheduler never sees a provider dialect.
+- **Region is a provider-internal concern.** When `create(region=None)` (the fleet path), the
+  provider **auto-selects** a region with capacity and, on `CapacityError`, **retries its
+  other regions** ordered by known capacity. This lets a provider gather its *full
+  cross-region* capacity (e.g. Crusoe's `rsv-002` = 4 reserved h100.8x nodes live only in
+  `us-west1`) without the scheduler having to model regions. The scheduler stays
+  `[(provider, n)]`.
+
 ---
 
 ## 7. Layer 2 — Fleet manager
@@ -160,30 +186,55 @@ tells the scheduler which providers are eligible for a fleet request.
 `vm fleet create --gpu <type> --count <n> [--name <fleet_name>]`,
 `vm fleet list`, `vm fleet status <name>`, `vm fleet destroy <name>`.
 
-### Scheduler strategy: S1 — capacity-aware greedy + failover
-- Query capacity best-effort (Crusoe exact via `/capacity`; Lambda region-level booleans
-  via `/instance-types`; Nebius **unknown** — no endpoint).
-- Order eligible providers by known availability; unknowns act as overflow buckets.
-- Assign counts up to what's known; execute concurrently; **cascade any shortfall /
-  `CapacityError` to the next provider** until count met or providers exhausted.
+### Scheduler strategy: round-robin even-spread, capped by known capacity
+- Query capacity best-effort per provider (Crusoe exact counts via `/capacity`; Lambda
+  region-level presence via `/instance-types` — **boolean, no counts**; Nebius **unknown**
+  — no endpoint). `known_capacity(provider) = sum of counts` where countable, else `None`.
+- **Round-robin** assign one VM at a time across eligible providers (README: "spread across
+  providers"), **capping** a provider once its *known* count is reached. Unknown-capacity
+  providers (Lambda, Nebius) are never capped by planning — they take their round-robin
+  share and rely on execution-time failover if over-assigned.
+- Returns `[(provider, n)]`. The sum may be `< count` only if *every* eligible provider has
+  a finite known cap and their total is below the request — in which case the shortfall is
+  surfaced immediately and rolled back.
 - Satisfies README challenge #1 (query capacity then allocate) and #2 (partial failure →
-  get rest from B/C), while treating numbers as hints and relying on attempt+failover for
-  correctness.
+  get rest from B/C), treating numbers as hints and relying on failover for correctness.
 
-### Execution (concurrency + rollback)
+**Lambda specifics (rank, don't size).** Lambda capacity is boolean, and `launch` is atomic
+all-or-nothing (`available < quantity → 400`, 0 created). So the scheduler can *rank* Lambda
+but not *size* it. The fleet path sidesteps this by always creating with **`count=1`
+(quantity=1 per launch)** — each VM is an independent success/failure, so Lambda partial-fills
+naturally and atomicity only ever affects a single VM. (Layer-1 `vm create --count N` on
+Lambda still uses the native atomic batch, honest to the real API.)
+
+### Execution — one concurrent round, then failover rounds (concurrency + rollback)
 ```
-plan = scheduler.allocate(gpu, count)          # [(provider, n), ...] ordered
+plan = scheduler.allocate(gpu, count, providers)   # [(provider, n)]
 provisioned = []
-with ThreadPoolExecutor() as pool:
-    for provider, n in plan:                    # cascade remainder
-        res = create_n_concurrently(provider, n)   # submit all, wait in parallel
-        provisioned += res.successes
-    if len(provisioned) < count:                # can't fulfill → ROLLBACK
-        destroy_all_concurrently(provisioned)   # tolerate reserved/un-destroyable
-        raise FleetUnfulfilledError(...)
-store.save(fleet_name, gpu, provisioned)        # persist only on full success
+# Round 1: flatten to `count` single-VM tasks and fire EVERY provider concurrently.
+tasks = [pname for pname, n in plan for _ in range(n)]
+made, exhausted = run_creates_concurrently(gpu, tasks, name)   # one flat ThreadPool
+provisioned += made
+# Failover rounds: redistribute only the shortfall to providers not yet exhausted.
+while len(provisioned) < count:
+    candidates = [p for p in eligible if p.name not in exhausted]
+    if not candidates: break
+    tasks = distribute(count - len(provisioned), candidates)   # round-robin the gap
+    made, more_exhausted = run_creates_concurrently(gpu, tasks, name)
+    provisioned += made
+    exhausted |= more_exhausted
+    if not made and not (candidates_left := ...): break        # no progress → stop
+if len(provisioned) < count:                                   # can't fulfill → ROLLBACK
+    destroy_all_concurrently(provisioned)                      # tolerate reserved/un-destroyable
+    raise FleetUnfulfilledError(...)
+store.save(fleet_name, gpu, provisioned)                       # persist only on full success
 ```
 
+- **Round 1 fires all providers at once** (flat `ThreadPoolExecutor` over `count` single-VM
+  creates) — true cross-provider parallelism (README challenge #5), ~one create of
+  wall-clock. `run_creates_concurrently` returns the successful `Instance`s and the set of
+  provider names that returned `CapacityError` this round (i.e. exhausted).
+- **Failover rounds** touch only the shortfall and skip exhausted providers; each ~3s.
 - **Concurrency = `ThreadPoolExecutor`** (not asyncio): Nebius gRPC stubs are synchronous
   and httpx works synchronously — threads unify both protocols with one mechanism.
 - **Rollback** destroys concurrently, swallows `ReservedInstanceError`/`NotFoundError`,

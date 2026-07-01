@@ -14,6 +14,8 @@
 - Package name: `vm`. Console entry: `python -m vm ...` (and a `vm` script via console_scripts).
 - Every normalized error subclasses `ProviderError` and carries a `provider: str`. CLI prints `Error [<provider>]: <msg>` to stderr with exit code 1 — never a raw traceback.
 - Canonical GPU vocabulary: `a100.1x, a100.8x, h100.1x, h100.8x, h200.1x, h200.8x`.
+- Canonical region vocabulary: `us-west, us-east, eu-west` (Crusoe `us-westN`/Lambda `us-west-N`/Nebius none). `capacity()` reports canonical regions; `--region` accepts canonical; region selection is provider-internal (auto-select + iterate on `CapacityError`).
+- Python target: works on 3.9+ (every module using `X | Y` annotations begins with `from __future__ import annotations`). Prefer a 3.11 venv if available.
 - Provider endpoints/keys/scope (from README): Crusoe `http://localhost:8001` / `crusoe-test-key-001` / project `proj-001`; Lambda `http://localhost:8002` / `lambda-test-key-001`; Nebius `localhost:50051` / `nebius-test-key-001` / parent `project-e1a2b3c4`.
 - Default ssh key `default-key`; default region: Crusoe `us-west1`, Lambda `us-west-1`, Nebius none.
 - Nebius stubs are imported by adding `<repo>/mock_servers/generated` to `sys.path` (computed from repo root); no proto compilation.
@@ -50,14 +52,21 @@ candidate/
 │   │   └── manager.py           # orchestration: create/list/status/destroy
 │   └── cli.py                   # argparse surface + top-level error handling
 └── tests/
-    ├── conftest.py              # session fixture: boot mock servers
-    ├── test_catalog.py
-    ├── test_errors.py
-    ├── test_store.py
-    ├── test_scheduler.py
-    ├── test_providers_integration.py
-    └── test_fleet_integration.py
+    ├── conftest.py              # per-provider session fixtures (start server if not running)
+    ├── test_catalog.py          # unit: GPU + region mapping, support matrix
+    ├── test_errors.py           # unit
+    ├── test_store.py            # unit
+    ├── test_scheduler.py        # unit: allocation with fakes
+    ├── test_cli_smoke.py        # unit: arg parsing
+    ├── test_lambda.py           # integration (lambda_server fixture)
+    ├── test_crusoe.py           # integration (crusoe_server fixture)
+    ├── test_nebius.py           # integration (nebius_server fixture)
+    └── test_fleet_integration.py   # integration (all_servers fixture)
 ```
+
+Per-provider test files + fixtures keep the integration suites **independent**, so the three
+provider builds can be implemented and tested in parallel (each touches only its own file and
+its own mock server on a distinct port).
 
 ---
 
@@ -325,6 +334,7 @@ def test_unknown_gpu_raises():
 - [ ] **Step 3: Implement `candidate/vm/catalog.py`**
 
 ```python
+from __future__ import annotations
 from vm.errors import InvalidArgumentError, UnsupportedOperationError
 
 # canonical -> per-provider mapping (None = unsupported by that provider)
@@ -378,6 +388,50 @@ def price(gpu: str) -> float | None:
 
 # canonical -> gpu_count (used when a provider reports capacity in GPUs)
 GPU_COUNT = {"a100.1x": 1, "a100.8x": 8, "h100.1x": 1, "h100.8x": 8, "h200.1x": 1, "h200.8x": 8}
+
+# --- region normalization ---
+# canonical region -> per-provider native name (None = provider has no region concept)
+_REGION = {
+    "us-west": {"crusoe": "us-west1", "lambda": "us-west-1", "nebius": None},
+    "us-east": {"crusoe": "us-east1", "lambda": "us-east-1", "nebius": None},
+    "eu-west": {"crusoe": "eu-west1", "lambda": "eu-west-1", "nebius": None},
+}
+REGIONS = list(_REGION.keys())
+# reverse index: (provider, native) -> canonical
+_REGION_REV = {(p, native): canon
+               for canon, m in _REGION.items() for p, native in m.items() if native}
+
+
+def region_to_native(provider: str, canonical: str | None) -> str | None:
+    """Canonical region -> provider-native. None stays None (provider default / no region)."""
+    if canonical is None:
+        return None
+    if canonical not in _REGION:
+        raise InvalidArgumentError("catalog", f"unknown region '{canonical}' (known: {', '.join(REGIONS)})")
+    return _REGION[canonical].get(provider)
+
+
+def region_to_canonical(provider: str, native: str | None) -> str | None:
+    """Provider-native region -> canonical (for normalizing capacity() output)."""
+    if native is None:
+        return None
+    return _REGION_REV.get((provider, native), native)
+```
+
+- [ ] **Step 3b: Append region tests to `candidate/tests/test_catalog.py`**
+
+```python
+def test_region_round_trip():
+    assert catalog.region_to_native("crusoe", "us-west") == "us-west1"
+    assert catalog.region_to_native("lambda", "us-west") == "us-west-1"
+    assert catalog.region_to_native("nebius", "us-west") is None
+    assert catalog.region_to_canonical("lambda", "us-west-1") == "us-west"
+    assert catalog.region_to_canonical("crusoe", "us-west1") == "us-west"
+
+
+def test_unknown_region_raises():
+    with pytest.raises(InvalidArgumentError):
+        catalog.region_to_native("crusoe", "mars-1")
 ```
 
 - [ ] **Step 4: Run — expect pass.**
@@ -386,7 +440,7 @@ GPU_COUNT = {"a100.1x": 1, "a100.8x": 8, "h100.1x": 1, "h100.8x": 8, "h200.1x": 
 
 ```bash
 git add candidate/vm/catalog.py candidate/tests/test_catalog.py
-git commit -m "feat: GPU catalog with per-provider mapping and support matrix"
+git commit -m "feat: GPU catalog + per-provider GPU/region mapping and support matrix"
 ```
 
 ---
@@ -405,6 +459,7 @@ git commit -m "feat: GPU catalog with per-provider mapping and support matrix"
 - [ ] **Step 1: Implement `candidate/vm/config.py`**
 
 ```python
+from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -418,7 +473,7 @@ class ProviderConfig:
     base_url: str
     api_key: str
     scope: str          # project id / parent id ("" for Lambda)
-    default_region: str | None
+    default_region: str | None   # CANONICAL region (see catalog); None = no region concept
     ssh_key: str
 
 
@@ -429,12 +484,12 @@ def _env(name: str, default: str) -> str:
 CRUSOE = ProviderConfig(
     base_url=_env("VM_CRUSOE_URL", "http://localhost:8001"),
     api_key=_env("VM_CRUSOE_KEY", "crusoe-test-key-001"),
-    scope="proj-001", default_region="us-west1", ssh_key="default-key",
+    scope="proj-001", default_region="us-west", ssh_key="default-key",
 )
 LAMBDA = ProviderConfig(
     base_url=_env("VM_LAMBDA_URL", "http://localhost:8002"),
     api_key=_env("VM_LAMBDA_KEY", "lambda-test-key-001"),
-    scope="", default_region="us-west-1", ssh_key="default-key",
+    scope="", default_region="us-west", ssh_key="default-key",
 )
 NEBIUS = ProviderConfig(
     base_url=_env("VM_NEBIUS_URL", "localhost:50051"),
@@ -546,7 +601,11 @@ git commit -m "feat: Provider ABC, capabilities, poll-until-state helper"
 
 **Behaviour notes (from mock):** launch is synchronous (instances already `active`); `POST /api/v1/instance-operations/launch` accepts `quantity`; error bodies are `{"detail": {"error": {"code","message","suggestion"}}}`; reserved instances 400 on terminate; no stop/start endpoints.
 
-- [ ] **Step 1: Write conftest fixture** `candidate/tests/conftest.py`
+- [ ] **Step 1: Write conftest with per-provider fixtures** `candidate/tests/conftest.py`
+
+Per-provider session fixtures so provider test files are isolated (each starts only its own
+server, and only if its port isn't already serving — safe when servers are pre-started or
+when agents run provider suites in parallel on distinct ports).
 
 ```python
 import os
@@ -556,51 +615,73 @@ import sys
 import time
 import pytest
 
-MOCK_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "mock_servers")
+MOCK_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "mock_servers"))
+_VENV_PY = os.path.join(MOCK_DIR, ".venv", "bin", "python")
+PY = _VENV_PY if os.path.exists(_VENV_PY) else sys.executable
 
 
-def _wait_http(url, tries=40):
-    import httpx
-    for _ in range(tries):
-        try:
-            httpx.get(url, timeout=1.0)
+def _port_open(host, port):
+    try:
+        with socket.create_connection((host, port), timeout=0.5):
             return True
-        except Exception:
-            time.sleep(0.5)
-    return False
+    except OSError:
+        return False
 
 
-def _wait_port(host, port, tries=40):
-    for _ in range(tries):
-        try:
-            with socket.create_connection((host, port), timeout=1.0):
-                return True
-        except OSError:
-            time.sleep(0.5)
-    return False
+def _http_ready(url):
+    import httpx
+    try:
+        httpx.get(url, timeout=1.0)
+        return True
+    except Exception:
+        return False
+
+
+def _ensure(script, port, ready):
+    """Start one mock server if its port isn't already serving. Return proc or None."""
+    if _port_open("localhost", port):
+        return None
+    proc = subprocess.Popen([PY, script], cwd=MOCK_DIR,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(40):
+        if ready():
+            return proc
+        time.sleep(0.5)
+    proc.terminate()
+    pytest.skip(f"{script} did not start")
 
 
 @pytest.fixture(scope="session")
-def servers():
-    procs = []
-    for script in ("crusoe_server.py", "lambda_server.py", "nebius_server.py"):
-        procs.append(subprocess.Popen(
-            [sys.executable, script], cwd=MOCK_DIR,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
-    ok = (_wait_http("http://localhost:8001/docs")
-          and _wait_http("http://localhost:8002/docs")
-          and _wait_port("localhost", 50051))
-    time.sleep(1.0)
-    if not ok:
-        for p in procs:
-            p.terminate()
-        pytest.skip("mock servers did not start")
+def lambda_server():
+    proc = _ensure("lambda_server.py", 8002, lambda: _http_ready("http://localhost:8002/docs"))
     yield
-    for p in procs:
-        p.terminate()
+    if proc:
+        proc.terminate()
+
+
+@pytest.fixture(scope="session")
+def crusoe_server():
+    proc = _ensure("crusoe_server.py", 8001, lambda: _http_ready("http://localhost:8001/docs"))
+    yield
+    if proc:
+        proc.terminate()
+
+
+@pytest.fixture(scope="session")
+def nebius_server():
+    proc = _ensure("nebius_server.py", 50051, lambda: _port_open("localhost", 50051))
+    time.sleep(1.0)
+    yield
+    if proc:
+        proc.terminate()
+
+
+@pytest.fixture(scope="session")
+def all_servers(lambda_server, crusoe_server, nebius_server):
+    yield
 ```
 
-- [ ] **Step 2: Write failing test** `candidate/tests/test_providers_integration.py`
+- [ ] **Step 2: Write failing test** `candidate/tests/test_lambda.py`
 
 ```python
 import pytest
@@ -611,7 +692,7 @@ from vm.errors import UnsupportedOperationError, ReservedInstanceError
 pytestmark = pytest.mark.integration
 
 
-def test_lambda_list_and_create_and_destroy(servers):
+def test_lambda_list_and_create_and_destroy(lambda_server):
     p = LambdaProvider()
     before = p.list()
     assert any(i.provider == "lambda" for i in before)
@@ -620,26 +701,34 @@ def test_lambda_list_and_create_and_destroy(servers):
     assert res.fulfilled == 1
     inst = res.successes[0]
     assert inst.state == State.RUNNING and inst.gpu_type == "h100.1x"
+    assert inst.region == "us-west"  # canonical region reported
 
     got = p.get(inst.id)
     assert got.id == inst.id
     p.destroy(inst.id)
 
 
-def test_lambda_stop_unsupported(servers):
+def test_lambda_stop_unsupported(lambda_server):
     p = LambdaProvider()
     with pytest.raises(UnsupportedOperationError):
         p.stop("anything")
 
 
-def test_lambda_cannot_terminate_reserved(servers):
+def test_lambda_cannot_terminate_reserved(lambda_server):
     p = LambdaProvider()
     reserved = next(i for i in p.list() if i.reserved)
     with pytest.raises(ReservedInstanceError):
         p.destroy(reserved.id)
+
+
+def test_lambda_capacity_reports_canonical_regions(lambda_server):
+    slots = LambdaProvider().capacity("h100.1x")
+    assert slots is not None
+    assert all(s.available is None for s in slots)        # boolean presence, no counts
+    assert all(s.region in ("us-west", "us-east", "eu-west") for s in slots)
 ```
 
-- [ ] **Step 3: Run — expect fail** `cd candidate && python -m pytest tests/test_providers_integration.py -q -m integration`
+- [ ] **Step 3: Run — expect fail** `cd candidate && python -m pytest tests/test_lambda.py -q`
 
 - [ ] **Step 4: Implement `candidate/vm/providers/lambda_.py`**
 
@@ -713,21 +802,45 @@ class LambdaProvider(Provider):
             self._raise(r)
         return self._normalize(r.json()["data"])
 
+    def _regions_to_try(self, gpu: str) -> list[str]:
+        """Native regions to attempt when region is unspecified: default first, then any
+        region reported with capacity. Lets a create gather capacity across regions."""
+        default_native = catalog.region_to_native(self.name, self._cfg.default_region)
+        order = [default_native] if default_native else []
+        for s in (self.capacity(gpu) or []):
+            native = catalog.region_to_native(self.name, s.region)
+            if native and native not in order:
+                order.append(native)
+        return order or [default_native]
+
     def create(self, gpu, count=1, name=None, region=None, wait=True) -> CreateResult:
-        native = catalog.to_native(self.name, gpu)  # UnsupportedOperationError if not supported
-        region = region or self._cfg.default_region
-        body = {"region_name": region, "instance_type_name": native["instance_type_name"],
-                "ssh_key_names": [self._cfg.ssh_key], "name": name or gpu, "quantity": count}
+        native_type = catalog.to_native(self.name, gpu)["instance_type_name"]
         res = CreateResult(requested=count)
-        r = self._http.post("/api/v1/instance-operations/launch", json=body)
-        if r.status_code >= 400:
-            try:
-                self._raise(r)
-            except ProviderError as e:
-                res.errors.append(e)
-                return res
-        for iid in r.json()["data"]["instance_ids"]:
-            res.successes.append(self.get(iid))  # already active (synchronous)
+        # Explicit region → honor it only; unspecified → auto-select / iterate regions.
+        # Note: Lambda launch is atomic all-or-nothing per region (fleet path uses count=1).
+        if region is not None:
+            regions = [catalog.region_to_native(self.name, region)]
+        else:
+            regions = self._regions_to_try(gpu)
+        last_err = None
+        for native_region in regions:
+            body = {"region_name": native_region, "instance_type_name": native_type,
+                    "ssh_key_names": [self._cfg.ssh_key], "name": name or gpu, "quantity": count}
+            r = self._http.post("/api/v1/instance-operations/launch", json=body)
+            if r.status_code >= 400:
+                try:
+                    self._raise(r)
+                except CapacityError as e:
+                    last_err = e
+                    continue  # try next region
+                except ProviderError as e:
+                    res.errors.append(e)
+                    return res
+            for iid in r.json()["data"]["instance_ids"]:
+                res.successes.append(self.get(iid))  # already active (synchronous)
+            return res
+        if last_err:
+            res.errors.append(last_err)
         return res
 
     def stop(self, instance_id: str) -> Instance:
@@ -749,16 +862,18 @@ class LambdaProvider(Provider):
             self._raise(r)
         entry = r.json()["data"].get(native["instance_type_name"], {})
         regions = entry.get("regions_with_capacity_available", [])
-        # region-level availability only (no counts) → available=None (unknown count, but >0)
-        return [CapacitySlot(self.name, gpu, reg["name"], None) for reg in regions]
+        # region-level presence only (no counts) → available=None; report canonical regions
+        return [CapacitySlot(self.name, gpu,
+                             catalog.region_to_canonical(self.name, reg["name"]), None)
+                for reg in regions]
 ```
 
-- [ ] **Step 5: Run — expect pass** `cd candidate && python -m pytest tests/test_providers_integration.py -q -m integration -k lambda`
+- [ ] **Step 5: Run — expect pass** `cd candidate && python -m pytest tests/test_lambda.py -q`
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add candidate/vm/providers/lambda_.py candidate/tests/conftest.py candidate/tests/test_providers_integration.py
+git add candidate/vm/providers/lambda_.py candidate/tests/conftest.py candidate/tests/test_lambda.py
 git commit -m "feat: Lambda provider (sync REST) + integration harness"
 ```
 
@@ -775,32 +890,45 @@ git commit -m "feat: Lambda provider (sync REST) + integration harness"
 
 **Behaviour notes:** all URLs prefixed `/v1alpha5/projects/proj-001`; create/stop/start/destroy async → poll instance state; `GET .../instances/{id}` returns the VM dict directly (404 on missing → destroy completion signal); error bodies `{"detail": {"code","message"}}`; `/capacity` gives exact `on_demand_available`+`reserved_available`.
 
-- [ ] **Step 1: Write failing test** (append)
+- [ ] **Step 1: Write failing test** `candidate/tests/test_crusoe.py`
 
 ```python
-def test_crusoe_full_lifecycle(servers):
-    from vm.providers.crusoe import CrusoeProvider
+import pytest
+from vm.providers.crusoe import CrusoeProvider
+from vm.models import State
+from vm.errors import NotFoundError
+
+pytestmark = pytest.mark.integration
+
+
+def test_crusoe_full_lifecycle(crusoe_server):
     p = CrusoeProvider()
-    res = p.create("h100.1x", count=1, name="crusoe-plan", region="us-west1")
+    res = p.create("h100.1x", count=1, name="crusoe-plan", region="us-west")
     assert res.fulfilled == 1
     inst = res.successes[0]
     assert inst.state == State.RUNNING
+    assert inst.region == "us-west"  # canonical
     stopped = p.stop(inst.id)
     assert stopped.state == State.STOPPED
     started = p.start(inst.id)
     assert started.state == State.RUNNING
     p.destroy(inst.id)
-    import pytest as _pt
-    from vm.errors import NotFoundError as _NF
-    with _pt.raises(_NF):
+    with pytest.raises(NotFoundError):
         p.get(inst.id)
 
 
-def test_crusoe_capacity_reports_counts(servers):
-    from vm.providers.crusoe import CrusoeProvider
+def test_crusoe_capacity_reports_counts_and_canonical_regions(crusoe_server):
     slots = CrusoeProvider().capacity("h100.8x")
     assert slots is not None
     assert all(s.available is not None for s in slots)
+    assert all(s.region in ("us-west", "us-east", "eu-west") for s in slots)
+
+
+def test_crusoe_create_autoselects_region_when_unspecified(crusoe_server):
+    p = CrusoeProvider()
+    res = p.create("h100.1x", count=1, name="crusoe-auto")  # region=None → auto-select
+    assert res.fulfilled == 1
+    p.destroy(res.successes[0].id)
 ```
 
 - [ ] **Step 2: Run — expect fail.**
@@ -872,23 +1000,54 @@ class CrusoeProvider(Provider):
             return inst if inst.state in targets else None
         return self._await(check)
 
-    def create(self, gpu, count=1, name=None, region=None, wait=True) -> CreateResult:
-        native = catalog.to_native(self.name, gpu)
-        region = region or self._cfg.default_region
-        res = CreateResult(requested=count)
-        for i in range(count):
-            vm_name = f"{name or gpu}-{i}" if count > 1 else (name or gpu)
-            body = {"name": vm_name, "type": native["type"], "location": region,
+    def _regions_to_try(self, gpu: str) -> list[str]:
+        """Native regions ordered: default first, then others by known capacity desc.
+        Lets one provider gather its full cross-region capacity (e.g. reserved nodes in a
+        single region) instead of stranding it behind a fixed default."""
+        default_native = catalog.region_to_native(self.name, self._cfg.default_region)
+        slots = sorted(self.capacity(gpu) or [],
+                       key=lambda s: (s.region != self._cfg.default_region, -(s.available or 0)))
+        natives = []
+        for s in slots:
+            if (s.available or 0) <= 0:
+                continue
+            native = catalog.region_to_native(self.name, s.region)
+            if native and native not in natives:
+                natives.append(native)
+        if default_native and default_native not in natives:
+            natives.insert(0, default_native)
+        return natives or [default_native]
+
+    def _create_one(self, native_type: str, vm_name: str, regions: list[str], wait: bool) -> Instance:
+        last_err = None
+        for native_region in regions:
+            body = {"name": vm_name, "type": native_type, "location": native_region,
                     "ssh_key": self._cfg.ssh_key}
             r = self._http.post(f"{self._base}/compute/vms/instances", json=body)
             if r.status_code >= 400:
                 try:
                     self._raise(r)
-                except ProviderError as e:
-                    res.errors.append(e)
-                    continue
-            iid = r.json()["instance"]["id"]
-            res.successes.append(self._await_state(iid, {State.RUNNING}) if wait else self.get(iid))
+                except CapacityError as e:
+                    last_err = e
+                    continue  # try next region
+            else:
+                iid = r.json()["instance"]["id"]
+                return self._await_state(iid, {State.RUNNING}) if wait else self.get(iid)
+        raise last_err  # exhausted all regions with CapacityError
+
+    def create(self, gpu, count=1, name=None, region=None, wait=True) -> CreateResult:
+        native_type = catalog.to_native(self.name, gpu)["type"]
+        if region is not None:
+            regions = [catalog.region_to_native(self.name, region)]
+        else:
+            regions = self._regions_to_try(gpu)
+        res = CreateResult(requested=count)
+        for i in range(count):
+            vm_name = f"{name or gpu}-{i}" if count > 1 else (name or gpu)
+            try:
+                res.successes.append(self._create_one(native_type, vm_name, regions, wait))
+            except ProviderError as e:
+                res.errors.append(e)
         return res
 
     def stop(self, instance_id: str) -> Instance:
@@ -923,17 +1082,19 @@ class CrusoeProvider(Provider):
         r = self._http.get(f"{self._base}/capacity")
         if r.status_code >= 400:
             self._raise(r)
-        return [CapacitySlot(self.name, gpu, c["location"], c["total_available"])
+        return [CapacitySlot(self.name, gpu,
+                             catalog.region_to_canonical(self.name, c["location"]),
+                             c["total_available"])
                 for c in r.json()["items"] if c["vm_type"] == native["type"]]
 ```
 
-- [ ] **Step 4: Run — expect pass** (`-k crusoe`).
+- [ ] **Step 4: Run — expect pass** `cd candidate && python -m pytest tests/test_crusoe.py -q`
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add candidate/vm/providers/crusoe.py candidate/tests/test_providers_integration.py
-git commit -m "feat: Crusoe provider (async REST, project-scoped, poll-by-state)"
+git add candidate/vm/providers/crusoe.py candidate/tests/test_crusoe.py
+git commit -m "feat: Crusoe provider (async REST, project-scoped, poll-by-state, region iteration)"
 ```
 
 ---
@@ -949,28 +1110,33 @@ git commit -m "feat: Crusoe provider (async REST, project-scoped, poll-by-state)
 
 **Behaviour notes:** import stubs by inserting `config.GENERATED_PATH` on `sys.path`; metadata `("authorization", "Bearer <key>")`; **no operation-polling RPC** → poll `Get(resource_id)`; state is an int enum; `capacity()` returns `None` (no endpoint); errors are `grpc.RpcError` with `.code()`.
 
-- [ ] **Step 1: Write failing test** (append)
+- [ ] **Step 1: Write failing test** `candidate/tests/test_nebius.py`
 
 ```python
-def test_nebius_list_and_create(servers):
-    from vm.providers.nebius import NebiusProvider
+import pytest
+from vm.providers.nebius import NebiusProvider
+from vm.models import State
+from vm.errors import AuthError
+
+pytestmark = pytest.mark.integration
+
+
+def test_nebius_list_and_create(nebius_server):
     p = NebiusProvider()
     assert any(i.provider == "nebius" for i in p.list())
     res = p.create("h100.1x", count=1, name="neb-plan")
     assert res.fulfilled == 1
     inst = res.successes[0]
     assert inst.state == State.RUNNING
+    assert inst.region is None  # Nebius has no region concept
     p.destroy(inst.id)
 
 
-def test_nebius_capacity_unknown(servers):
-    from vm.providers.nebius import NebiusProvider
+def test_nebius_capacity_unknown(nebius_server):
     assert NebiusProvider().capacity("h100.8x") is None
 
 
-def test_nebius_auth_error(servers):
-    from vm.providers.nebius import NebiusProvider
-    from vm.errors import AuthError
+def test_nebius_auth_error(nebius_server):
     p = NebiusProvider(api_key="bad-key")
     with pytest.raises(AuthError):
         p.list()
@@ -1108,12 +1274,12 @@ class NebiusProvider(Provider):
         return None  # Nebius exposes no capacity endpoint
 ```
 
-- [ ] **Step 4: Run — expect pass** (`-k nebius`).
+- [ ] **Step 4: Run — expect pass** `cd candidate && python -m pytest tests/test_nebius.py -q`
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add candidate/vm/providers/nebius.py candidate/tests/test_providers_integration.py
+git add candidate/vm/providers/nebius.py candidate/tests/test_nebius.py
 git commit -m "feat: Nebius provider (gRPC, poll-by-state, capacity unknown)"
 ```
 
@@ -1446,40 +1612,49 @@ git commit -m "feat: fleet JSON store with atomic writes"
 ```python
 from vm.fleet import scheduler
 from vm.models import CapacitySlot
-from vm.providers.base import Capabilities
 
 
 class FakeProvider:
     def __init__(self, name, slots):
         self.name = name
-        self._slots = slots
-        self.capabilities = Capabilities(True, False, slots is not None)
+        self._slots = slots  # None = capacity unknown
 
     def capacity(self, gpu):
         return self._slots
 
 
-def test_allocate_orders_by_known_capacity_and_overflows_to_unknown():
-    crusoe = FakeProvider("crusoe", [CapacitySlot("crusoe", "h100.8x", "us-west1", 3)])
-    nebius = FakeProvider("nebius", None)  # unknown capacity
-    plan = scheduler.allocate("h100.8x", 8, [crusoe, nebius])
-    # crusoe takes its known 3, remainder 5 goes to nebius (overflow)
-    assert plan == [("crusoe", 3), ("nebius", 5)]
+def test_allocate_round_robin_spreads_evenly_across_unknown():
+    a, b, c = (FakeProvider("crusoe", None), FakeProvider("lambda", None), FakeProvider("nebius", None))
+    plan = dict(scheduler.allocate("h100.8x", 6, [a, b, c]))
+    assert plan == {"crusoe": 2, "lambda": 2, "nebius": 2}  # even spread
+
+
+def test_allocate_small_count_spans_multiple_providers():
+    a, b, c = (FakeProvider("crusoe", None), FakeProvider("lambda", None), FakeProvider("nebius", None))
+    plan = dict(scheduler.allocate("h100.8x", 2, [a, b, c]))
+    assert sum(plan.values()) == 2 and len(plan) == 2  # spread across 2, not packed onto 1
+
+
+def test_allocate_caps_known_capacity_provider_then_overflows_to_unknown():
+    crusoe = FakeProvider("crusoe", [CapacitySlot("crusoe", "h100.8x", "us-west", 3)])
+    nebius = FakeProvider("nebius", None)  # unknown → uncapped overflow
+    plan = dict(scheduler.allocate("h100.8x", 8, [crusoe, nebius]))
+    assert plan == {"crusoe": 3, "nebius": 5}  # crusoe capped at its known 3
 
 
 def test_allocate_skips_unsupported_providers():
-    lam = FakeProvider("lambda", [CapacitySlot("lambda", "h200.8x", "us-west-1", None)])
+    lam = FakeProvider("lambda", [CapacitySlot("lambda", "h200.8x", "us-west", None)])
     neb = FakeProvider("nebius", None)
     plan = scheduler.allocate("h200.8x", 2, [lam, neb])  # lambda can't do h200
     assert plan == [("nebius", 2)]
 
 
-def test_allocate_all_known_capacity():
-    a = FakeProvider("crusoe", [CapacitySlot("crusoe", "h100.8x", "us-west1", 2)])
-    b = FakeProvider("lambda", [CapacitySlot("lambda", "h100.8x", "us-west-1", None)])
-    plan = scheduler.allocate("h100.8x", 5, [a, b])
-    # crusoe known 2; lambda unknown → gets remainder 3
-    assert plan == [("crusoe", 2), ("lambda", 3)]
+def test_allocate_all_finite_below_request_returns_partial_plan():
+    a = FakeProvider("crusoe", [CapacitySlot("crusoe", "h100.8x", "us-west", 2)])
+    b = FakeProvider("lambda", [CapacitySlot("lambda", "h100.8x", "us-west", 1)])
+    # both finite, total 3 < 5 → plan sums to 3; manager surfaces the shortfall + rolls back
+    plan = dict(scheduler.allocate("h100.8x", 5, [a, b]))
+    assert sum(plan.values()) == 3
 ```
 
 - [ ] **Step 2: Run — expect fail.**
@@ -1496,7 +1671,8 @@ log = get_logger("vm.scheduler")
 
 
 def known_capacity(provider, gpu: str) -> int | None:
-    """Total known available count for gpu, or None if the provider can't report it."""
+    """Total known available count for gpu, or None if the provider can't report counts
+    (Lambda reports region presence but no counts; Nebius has no capacity endpoint)."""
     try:
         slots = provider.capacity(gpu)
     except ProviderError as e:
@@ -1509,41 +1685,34 @@ def known_capacity(provider, gpu: str) -> int | None:
 
 
 def allocate(gpu: str, count: int, providers: list) -> list[tuple[str, int]]:
-    """Best-effort plan: eligible providers, known-capacity first, unknowns as overflow.
+    """Round-robin even-spread across eligible providers, capped by known capacity.
 
-    Returns [(provider_name, n), ...]. The sum may be < count if all providers report
-    finite known capacity below the request; execution still fails over/rolls back.
+    README says "spread across providers", so we distribute one VM at a time round-robin
+    rather than packing. A provider with a known finite count is capped there; unknown-count
+    providers (Lambda, Nebius) are never capped by planning and rely on execution-time
+    failover if over-assigned. Returns [(provider_name, n), ...] in provider order.
+
+    The sum is < count only when every eligible provider has a finite known cap and their
+    total is below the request — the manager then surfaces the shortfall and rolls back.
     """
     eligible = [p for p in providers if catalog.supports(p.name, gpu)]
-    known, unknown = [], []
-    for p in eligible:
-        cap = known_capacity(p, gpu)
-        (known if cap is not None else unknown).append((p, cap))
-    known.sort(key=lambda t: t[1], reverse=True)
-
-    plan: list[tuple[str, int]] = []
+    caps = {p.name: known_capacity(p, gpu) for p in eligible}  # int cap, or None = uncapped
+    assigned = {p.name: 0 for p in eligible}
     remaining = count
-    for p, cap in known:
-        if remaining <= 0:
-            break
-        take = min(cap, remaining)
-        if take > 0:
-            plan.append((p.name, take))
-            remaining -= take
-    # overflow to unknown-capacity providers (spread evenly)
-    if remaining > 0 and unknown:
-        per = remaining // len(unknown)
-        extra = remaining % len(unknown)
-        for idx, (p, _) in enumerate(unknown):
-            n = per + (1 if idx < extra else 0)
-            if n > 0:
-                plan.append((p.name, n))
-        remaining = 0
-    # if still remaining (all known, capped), give leftover to the largest-known provider
-    if remaining > 0 and known:
-        name = known[0][0].name
-        plan.append((name, remaining))
-    return plan
+    while remaining > 0:
+        progressed = False
+        for p in eligible:
+            if remaining <= 0:
+                break
+            cap = caps[p.name]
+            if cap is not None and assigned[p.name] >= cap:
+                continue  # this provider's known capacity is exhausted
+            assigned[p.name] += 1
+            remaining -= 1
+            progressed = True
+        if not progressed:
+            break  # all known-capacity providers full and none are uncapped
+    return [(name, n) for name, n in assigned.items() if n > 0]
 ```
 
 - [ ] **Step 4: Run — expect pass.**
@@ -1577,29 +1746,31 @@ git commit -m "feat: fleet scheduler (capacity-aware allocation with overflow)"
 import pytest
 from vm.fleet.manager import FleetManager
 from vm.fleet.store import Store
+from vm.errors import FleetUnfulfilledError
 
 pytestmark = pytest.mark.integration
 
 
-def test_fleet_create_spans_providers_and_status(servers, tmp_path):
+def test_fleet_create_spans_providers_and_status(all_servers, tmp_path):
     fm = FleetManager(store=Store(path=tmp_path / "f.json"))
     rec = fm.create("h100.8x", count=3, name="spanfleet")
     assert len(rec.vms) == 3
     providers_used = {v["provider"] for v in rec.vms}
-    # h100.8x is offered by all three; limited capacity forces a spread
+    # round-robin spreads a 3-VM request across the eligible providers
     assert len(providers_used) >= 2
     st = fm.status("spanfleet")
     assert st["name"] == "spanfleet" and len(st["vms"]) == 3
+    assert all(v["state"] in ("RUNNING", "CREATING") for v in st["vms"])
     fm.destroy("spanfleet")
+    assert fm.store.get("spanfleet") is None
 
 
-def test_fleet_rollback_when_unfulfillable(servers, tmp_path):
+def test_fleet_rollback_when_unfulfillable(all_servers, tmp_path):
     fm = FleetManager(store=Store(path=tmp_path / "f.json"))
-    from vm.errors import FleetUnfulfilledError
+    # total h100.8x capacity across providers is ~14; 20 forces a shortfall → rollback
     with pytest.raises(FleetUnfulfilledError):
-        fm.create("h100.8x", count=999, name="toobig")  # exceeds all providers
-    # nothing persisted, everything rolled back
-    assert fm.store.get("toobig") is None
+        fm.create("h100.8x", count=20, name="toobig")
+    assert fm.store.get("toobig") is None  # nothing persisted, everything rolled back
 ```
 
 - [ ] **Step 2: Run — expect fail.**
@@ -1611,7 +1782,9 @@ from __future__ import annotations
 import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from vm.errors import CapacityError, ReservedInstanceError, NotFoundError, FleetUnfulfilledError, ProviderError
+from vm import catalog
+from vm.errors import (CapacityError, ReservedInstanceError, NotFoundError,
+                       FleetUnfulfilledError, ProviderError)
 from vm.fleet import scheduler
 from vm.fleet.store import Store, FleetRecord
 from vm.logging_setup import get_logger
@@ -1630,55 +1803,65 @@ class FleetManager:
         self._providers = providers if providers is not None else registry.all()
         self._by_name = {p.name: p for p in self._providers}
 
-    def _create_on(self, provider, gpu: str, n: int, name: str):
-        """Create up to n VMs on one provider concurrently; return list[Instance]."""
-        made = []
-        with ThreadPoolExecutor(max_workers=n) as pool:
-            futures = [pool.submit(provider.create, gpu, 1, f"{name}-{provider.name}-{i}")
-                       for i in range(n)]
-            for f in as_completed(futures):
-                res = f.result()
-                made += res.successes
+    def _run_round(self, gpu, provider_names, name, index_start):
+        """Create one VM per entry in provider_names, ALL concurrently (across providers).
+        Each create uses count=1 (so Lambda partial-fills instead of failing atomically).
+        Returns (successes: list[Instance], exhausted: set[provider_name])."""
+        successes, exhausted = [], set()
+        if not provider_names:
+            return successes, exhausted
+        with ThreadPoolExecutor(max_workers=min(len(provider_names), 16)) as pool:
+            futs = {}
+            for i, pname in enumerate(provider_names):
+                vm_name = f"{name}-{pname}-{index_start + i}"
+                futs[pool.submit(self._by_name[pname].create, gpu, 1, vm_name)] = pname
+            for f in as_completed(futs):
+                pname = futs[f]
+                try:
+                    res = f.result()
+                except ProviderError as e:  # e.g. UnsupportedOperationError raised pre-network
+                    log.error("[%s] create failed: %s", e.provider, e.message)
+                    exhausted.add(pname)
+                    continue
+                successes += res.successes
                 for e in res.errors:
                     log.error("[%s] create failed: %s", e.provider, e.message)
-        return made
+                    if isinstance(e, CapacityError):
+                        exhausted.add(pname)
+        return successes, exhausted
 
     def create(self, gpu: str, count: int, name: str) -> FleetRecord:
+        eligible = [p for p in self._providers if catalog.supports(p.name, gpu)]
+        if not eligible:
+            raise FleetUnfulfilledError(f"no provider supports {gpu}", 0, [])
         plan = scheduler.allocate(gpu, count, self._providers)
         log.info("fleet '%s' plan: %s", name, plan)
-        provisioned = []  # list[Instance]
-        remaining = count
 
-        # order providers by plan, then use any eligible provider for leftover failover
-        planned_names = [pn for pn, _ in plan]
-        order = planned_names + [p.name for p in self._providers
-                                 if p.name not in planned_names]
-        alloc = {pn: n for pn, n in plan}
+        # Round 1: fire every provider's allocation concurrently in one shot (cross-provider).
+        round1 = [pname for pname, n in plan for _ in range(n)]
+        provisioned, exhausted = self._run_round(gpu, round1, name, 0)
+        idx = len(round1)
 
-        for pname in order:
-            if remaining <= 0:
+        # Failover rounds: redistribute only the shortfall to providers not yet exhausted.
+        while len(provisioned) < count:
+            candidates = [p.name for p in eligible if p.name not in exhausted]
+            if not candidates:
                 break
-            provider = self._by_name[pname]
-            from vm import catalog
-            if not catalog.supports(pname, gpu):
-                continue
-            want = alloc.get(pname, remaining if pname not in planned_names else 0)
-            want = min(want or remaining, remaining)
-            if want <= 0:
-                want = remaining if pname not in planned_names else 0
-            if want <= 0:
-                continue
-            made = self._create_on(provider, gpu, want, name)
+            shortfall = count - len(provisioned)
+            tasks = [candidates[i % len(candidates)] for i in range(shortfall)]
+            log.warning("fleet '%s' failover: %d short, retrying on %s", name, shortfall, candidates)
+            made, more_exhausted = self._run_round(gpu, tasks, name, idx)
+            idx += len(tasks)
             provisioned += made
-            remaining -= len(made)
-            if len(made) < want:
-                log.warning("[%s] provided %d/%d — failing over", pname, len(made), want)
+            exhausted |= more_exhausted
+            if not made:
+                break  # no progress this round → stop (avoid spinning)
 
-        if remaining > 0:
-            log.error("fleet '%s' unfulfilled (%d/%d) — rolling back", name, count - remaining, count)
+        if len(provisioned) < count:
+            log.error("fleet '%s' unfulfilled (%d/%d) — rolling back", name, len(provisioned), count)
             undestroyable = self._rollback(provisioned)
             raise FleetUnfulfilledError(
-                f"could only provision {count - remaining}/{count} {gpu}",
+                f"could only provision {len(provisioned)}/{count} {gpu}",
                 rolled_back=len(provisioned) - len(undestroyable), undestroyable=undestroyable)
 
         rec = FleetRecord(
@@ -1690,16 +1873,18 @@ class FleetManager:
     def _rollback(self, instances) -> list[str]:
         """Destroy provisioned instances concurrently; return ids that couldn't be destroyed."""
         undestroyable = []
-        with ThreadPoolExecutor(max_workers=max(1, len(instances))) as pool:
+        if not instances:
+            return undestroyable
+        with ThreadPoolExecutor(max_workers=min(len(instances), 16)) as pool:
             fut = {pool.submit(self._by_name[i.provider].destroy, i.id): i for i in instances}
             for f in as_completed(fut):
                 inst = fut[f]
                 try:
                     f.result()
-                except (ReservedInstanceError,) as e:
+                except ReservedInstanceError as e:
                     log.warning("[%s] cannot destroy %s (reserved): %s", inst.provider, inst.id, e.message)
                     undestroyable.append(inst.id)
-                except (NotFoundError,):
+                except NotFoundError:
                     pass
                 except ProviderError as e:
                     log.error("[%s] rollback destroy failed for %s: %s", inst.provider, inst.id, e.message)
@@ -1713,14 +1898,13 @@ class FleetManager:
         rec = self.store.get(name)
         if rec is None:
             raise ValueError(f"unknown fleet '{name}'")
-        vms = []
 
         def probe(v):
             try:
                 inst = self._by_name[v["provider"]].get(v["id"])
                 return {**v, "state": inst.state.value}
             except NotFoundError:
-                return {**v, "state": "MISSING"}
+                return {**v, "state": "MISSING"}  # deleted out-of-band → drift
             except ProviderError as e:
                 log.error("[%s] status probe failed for %s: %s", v["provider"], v["id"], e.message)
                 return {**v, "state": "ERROR"}
@@ -1920,8 +2104,9 @@ git commit -m "docs: candidate README + verified unit/integration test pass"
 - §3 normalized model → Task 2. ✓
 - §4 error hierarchy + provider tag → Task 2 (+ translation in Tasks 6–8, surfaced in Tasks 9/12/13). ✓
 - §5 async poll-by-state → `_await` in Task 5; used by Crusoe/Nebius (Tasks 7/8); Lambda synchronous (Task 6). ✓
-- §6 catalog + support matrix → Task 3. ✓
-- §7 scheduler S1 + concurrency + rollback + store + status reconcile → Tasks 10–13. ✓
+- §6 catalog + support matrix + region normalization → Task 3 (GPU + region maps). ✓
+- §7 round-robin scheduler + concurrent round-1 & failover rounds + rollback + store +
+  status reconcile → Tasks 10–13; provider-internal region auto-select/iterate → Tasks 6–7. ✓
 - §8 config → Task 4. ✓
 - §9 CLI surface → Tasks 9 & 13. ✓
 - §10 testing (unit + integration) → tests in each task; Task 14 full pass. ✓
