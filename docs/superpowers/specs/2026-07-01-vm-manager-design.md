@@ -97,6 +97,18 @@ Every provider translates its native failure into one normalized exception:
 CLI catches these at the top level → clean one-line message + non-zero exit code.
 No raw tracebacks.
 
+**Provider identity in every error (required).** `ProviderError` is the base of the whole
+hierarchy and carries a `provider: str` field; each adapter sets it when translating a
+native failure. So an error always knows where it came from, and both the CLI and the fleet
+manager surface it:
+
+- CLI: `Error [crusoe]: no capacity for h100.8x in eu-west1`.
+- A small logging setup (`logging.py`, stdlib `logging`) emits `WARNING`/`ERROR` lines
+  tagged with the provider — e.g. during fleet scheduling/failover/rollback,
+  `logger.error("[nebius] create failed: RESOURCE_EXHAUSTED — failing over")`.
+- `CreateResult.errors` and the fleet summary list failures grouped by provider, so a
+  partial fleet clearly shows which provider fell short.
+
 ---
 
 ## 5. Async vs synchronous handling
@@ -235,7 +247,7 @@ Output: table by default (via a small renderer), `--json` for machine-readable.
 
 ## 11. Build order (incremental)
 
-1. Scaffolding: `models`, `errors`, `config`, `catalog`, `providers/base`, `output`, `cli` skeleton.
+1. Scaffolding: `models`, `errors` (provider-tagged), `logging`, `config`, `catalog`, `providers/base`, `output`, `cli` skeleton.
 2. **Lambda** provider (synchronous, simplest) — `list` + `create` green end-to-end first.
 3. **Crusoe** provider (async polling + project scoping).
 4. **Nebius** provider (gRPC, wire in generated stubs).
